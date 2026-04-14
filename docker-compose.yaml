@@ -1,0 +1,18 @@
+services:
+  pomade-signer:
+    build:
+      context: .
+      dockerfile: pomade-signer-rust/Dockerfile
+      #dockerfile: pomade-signer-go/Dockerfile
+      #dockerfile: pomade-signer-ts/Dockerfile
+    container_name: "pomade-signer"
+    image: pomade-signer-rust
+    #image: pomade-signer-go
+    #image: pomade-signer-ts
+    env_file:
+      - ./env
+    ports:
+      - "3018:3018"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

@@ -32,10 +32,10 @@ RUN mkdir -p /data
 
 # Set default environment variables
 ENV POMADE_DATABASE=/data
-ENV POMADE_URL=http://localhost:3000
+ENV POMADE_URL=http://localhost:3018
 ENV MAIL_FROM_EMAIL=noreply@example.com
 ENV MAIL_FROM_NAME="Pomade Signer"
 
-EXPOSE 3000
+EXPOSE 3018
 
 CMD ["pomade-signer"]

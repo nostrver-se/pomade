@@ -299,22 +299,22 @@ sudo chmod 700 /var/lib/pomade
 Replace `pomade-signer-ts` with `pomade-signer-rust` or `pomade-signer-go` as appropriate for this server.
 
 ```bash
-sudo docker pull ghcr.io/coracle-social/pomade-signer-ts:latest
+sudo docker pull ghcr.io/coracle-social/pomade-signer-rust:latest
 
 sudo docker run -d \
   --name pomade-signer \
   --restart unless-stopped \
-  --env-file /etc/pomade/env \
+  --env-file ./env \
   --read-only \
   --tmpfs /tmp \
-  -v /var/lib/pomade:/data \
-  -p 127.0.0.1:3000:3000 \
-  ghcr.io/coracle-social/pomade-signer-ts:latest
+  -v ./data:/data \
+  -p 127.0.0.1:3018:3000 \
+  ghcr.io/coracle-social/pomade-signer-rust:latest
 ```
 
 Key flags:
-- `-p 127.0.0.1:3000:3000` — binds only on loopback; nginx is the only entry point.
-- `--read-only --tmpfs /tmp` — the container filesystem is immutable; only `/data` is writable.
+- `-p 127.0.0.1:3018:3000` — binds only on loopback; nginx is the only entry point.
+- `--read-only --tmpfs /tmp` — the container filesystem is immutable; only `./data` is writable.
 - `--restart unless-stopped` — survives reboots and crashes.
 
 Verify it is running:
@@ -322,7 +322,7 @@ Verify it is running:
 ```bash
 sudo docker ps
 sudo docker logs pomade-signer
-curl http://127.0.0.1:3000/
+curl http://127.0.0.1:3018/
 ```
 
 ---
