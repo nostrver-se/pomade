@@ -12,29 +12,68 @@ const GO_SIGNER_BIN = join(REPO_ROOT, "pomade-signer-go/bin/pomade-signer")
 
 export type SignerKind = "ts" | "rust" | "go"
 
-export type SignerInstance = {
-  url: string
-  stop: () => void
+const SIGNER_BINS: Record<SignerKind, {path: string; build: string}> = {
+  ts: {path: TS_SIGNER_BIN, build: "pnpm --filter @pomade/signer build"},
+  rust: {
+    path: RUST_SIGNER_BIN,
+    build: "cargo build --release (in pomade-signer-rust/)",
+  },
+  go: {
+    path: GO_SIGNER_BIN,
+    build: "go build -o bin/pomade-signer . (in pomade-signer-go/)",
+  },
 }
 
-function waitForPort(port: number): Promise<void> {
+export type SignerInstance = {
+  url: string
+  stop: () => Promise<void>
+}
+
+function waitForPort(port: number, proc: ChildProcess, getOutput: () => string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const deadline = setTimeout(
-      () => reject(new Error(`Signer on port ${port} did not start in time`)),
-      15_000,
-    )
+    let settled = false
+    let pollTimer: ReturnType<typeof setTimeout> | undefined
+    let deadline: ReturnType<typeof setTimeout> | undefined
+
+    const finish = (fn: () => void) => {
+      if (settled) return
+      settled = true
+      if (deadline) clearTimeout(deadline)
+      if (pollTimer) clearTimeout(pollTimer)
+      proc.off("exit", onExit)
+      fn()
+    }
+
+    // Fail fast (and informatively) if the signer crashes before binding,
+    // instead of waiting out the whole deadline on an unhelpful timeout.
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) =>
+      finish(() =>
+        reject(
+          new Error(
+            `Signer on port ${port} exited before becoming ready (code=${code}, signal=${signal})\n${getOutput()}`,
+          ),
+        ),
+      )
 
     const tryConnect = () => {
+      if (settled) return
       fetch(`http://127.0.0.1:${port}/register`, {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: "{}",
       })
-        .then(() => { clearTimeout(deadline); resolve() })
-        .catch(() => setTimeout(tryConnect, 100))
+        .then(() => finish(resolve))
+        .catch(() => {
+          if (!settled) pollTimer = setTimeout(tryConnect, 100)
+        })
     }
 
-    setTimeout(tryConnect, 200)
+    deadline = setTimeout(
+      () => finish(() => reject(new Error(`Signer on port ${port} did not start within 20s`))),
+      20_000,
+    )
+    proc.on("exit", onExit)
+    pollTimer = setTimeout(tryConnect, 200)
   })
 }
 
@@ -43,10 +82,6 @@ async function spawnSigner(
   port: number,
   challengePayloads: ChallengePayload[],
 ): Promise<SignerInstance> {
-  if (kind === "go" && !existsSync(GO_SIGNER_BIN)) {
-    throw new Error(`go signer binary not found at ${GO_SIGNER_BIN}`)
-  }
-
   const secret = makeSecret()
   const url = `http://127.0.0.1:${port}`
   const dataDir = mkdtempSync(join(tmpdir(), `pomade-signer-${kind}-${port}-`))
@@ -96,30 +131,74 @@ async function spawnSigner(
     })
   }
 
-  const tag = `[${kind}:${port}]`
+  // Keep a small tail of recent output so a startup crash produces a useful
+  // error instead of a bare timeout.
+  const outputTail: string[] = []
+  const record = (line: string) => {
+    if (line.trim()) {
+      outputTail.push(line)
+      if (outputTail.length > 30) outputTail.shift()
+    }
+    parseLine(line)
+  }
 
   proc.stdout?.on("data", (chunk: Buffer) => {
-    for (const line of chunk.toString().split("\n")) {
-      // if (line.trim()) process.stdout.write(`${tag} ${line}\n`)
-      parseLine(line)
-    }
+    for (const line of chunk.toString().split("\n")) record(line)
   })
   proc.stderr?.on("data", (chunk: Buffer) => {
-    for (const line of chunk.toString().split("\n")) {
-      // if (line.trim()) process.stderr.write(`${tag} ${line}\n`)
-      parseLine(line)
-    }
+    for (const line of chunk.toString().split("\n")) record(line)
   })
 
-  await waitForPort(port)
+  await waitForPort(port, proc, () => outputTail.join("\n"))
 
-  return {
-    url,
-    stop: () => {
-      proc.kill("SIGTERM")
-      try { rmSync(dataDir, {recursive: true, force: true}) } catch { /* ignore */ }
-    },
+  // Drain the process on stop: SIGTERM, await actual exit (SIGKILL fallback),
+  // then remove the data dir. teardownSuite awaits this, so the next test's
+  // beforeEach never spawns its batch on top of still-dying processes — which
+  // was the cause of the "did not start in time" flakiness under load.
+  let stopPromise: Promise<void> | undefined
+  const stop = () => {
+    if (stopPromise) return stopPromise
+
+    stopPromise = new Promise<void>(resolve => {
+      const cleanup = () => {
+        try {
+          rmSync(dataDir, {recursive: true, force: true})
+        } catch {
+          /* ignore */
+        }
+        resolve()
+      }
+
+      if (proc.exitCode !== null || proc.signalCode !== null) {
+        cleanup()
+        return
+      }
+
+      const killTimer = setTimeout(() => {
+        try {
+          proc.kill("SIGKILL")
+        } catch {
+          /* ignore */
+        }
+      }, 3_000)
+
+      proc.once("exit", () => {
+        clearTimeout(killTimer)
+        cleanup()
+      })
+
+      try {
+        proc.kill("SIGTERM")
+      } catch {
+        clearTimeout(killTimer)
+        cleanup()
+      }
+    })
+
+    return stopPromise
   }
+
+  return {url, stop}
 }
 
 let nextPort = 14000
@@ -128,9 +207,24 @@ function allocatePort(): number {
   return nextPort++
 }
 
+export function assertSignersAvailable(specs: SignerKind[]): void {
+  const missing = [...new Set(specs)]
+    .map(kind => SIGNER_BINS[kind])
+    .filter(bin => !existsSync(bin.path))
+
+  if (missing.length > 0) {
+    throw new Error(
+      "Signer binaries are missing. Build them before running tests:\n" +
+        missing.map(bin => `  - ${bin.path}\n    ${bin.build}`).join("\n"),
+    )
+  }
+}
+
 export async function spawnSigners(
   specs: SignerKind[],
   challengePayloads: ChallengePayload[],
 ): Promise<SignerInstance[]> {
+  assertSignersAvailable(specs)
+
   return Promise.all(specs.map(kind => spawnSigner(kind, allocatePort(), challengePayloads)))
 }

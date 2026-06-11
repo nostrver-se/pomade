@@ -10,11 +10,17 @@ export type PreppedRequest = {
   options?: {
     method: "POST"
     body: string
+    signal: AbortSignal
     headers: {
       "Content-Type": string
       Authorization: string
     }
   }
+}
+
+export type RpcOptions = {
+  pow?: number
+  signal?: AbortSignal
 }
 
 export class RPC {
@@ -41,13 +47,15 @@ export class RPC {
     signerUrl: string,
     path: string,
     body: unknown,
-    pow?: number,
+    {pow, signal}: RpcOptions = {},
   ): Promise<PreppedRequest> {
     const requestUrl = `${signerUrl}${path}`
     const requestBody = JSON.stringify(body)
 
     try {
       const authHeader = await this.makeAuthHeader(requestUrl, requestBody, pow)
+      const timeoutSignal = AbortSignal.timeout(15_000)
+      const combinedSignal = signal ? AbortSignal.any([timeoutSignal, signal]) : timeoutSignal
 
       return {
         signerUrl,
@@ -55,6 +63,7 @@ export class RPC {
         options: {
           method: "POST",
           body: requestBody,
+          signal: combinedSignal,
           headers: {
             "Content-Type": "application/json",
             Authorization: authHeader,
@@ -87,7 +96,12 @@ export class RPC {
     }
   }
 
-  async post<T>(signerUrl: string, path: string, body: unknown, pow?: number): Promise<Message<T>> {
-    return this.send<T>(await this.prep(signerUrl, path, body, pow))
+  async post<T>(
+    signerUrl: string,
+    path: string,
+    body: unknown,
+    options: RpcOptions = {},
+  ): Promise<Message<T>> {
+    return this.send<T>(await this.prep(signerUrl, path, body, options))
   }
 }

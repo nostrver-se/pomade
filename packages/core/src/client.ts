@@ -8,7 +8,7 @@ import {
   first,
   last,
   isDefined,
-  sample,
+  indexBy,
   textEncoder,
   identity,
 } from "@welshman/lib"
@@ -18,8 +18,8 @@ import {hexToBytes, bytesToHex} from "@noble/hashes/utils.js"
 import {prep, makeSecret} from "@welshman/util"
 import type {StampedEvent, SignedEvent} from "@welshman/util"
 import {Lib} from "@frostr/bifrost"
-import type {GroupPackage} from "@frostr/bifrost"
-import {context, hashEmail, hashPassword} from "./util.js"
+import type {CommitPackage, GroupPackage} from "@frostr/bifrost"
+import {context, hashEmail, hashPassword, permutations, delay} from "./util.js"
 import {RPC} from "./rpc.js"
 import {PomadeSigner} from "./pomade-signer.js"
 import {
@@ -34,7 +34,8 @@ import {
   SessionDeactivateResponse,
   SessionDeleteResponse,
   SessionListResponse,
-  SignResponse,
+  SignCommitResponse,
+  SignCompleteResponse,
   EcdhResponse,
 } from "./message.js"
 
@@ -144,7 +145,7 @@ export class Client {
             url,
             "/register",
             {share, group, recovery},
-            context.registerPow,
+            {pow: context.registerPow},
           )
 
           if (message.res?.ok) {
@@ -323,64 +324,142 @@ export class Client {
     return {ok: Boolean(userSecret), messages, userSecret}
   }
 
-  async sign(stampedEvent: StampedEvent) {
+  async racePermutations<T>(
+    fn: (selectedCommits: CommitPackage[], signal: AbortSignal) => Promise<T>,
+  ): Promise<T | undefined> {
     const {threshold, commits} = this.group
     const availableCommits = commits.filter(c => this.peers[c.idx - 1])
 
     if (availableCommits.length < threshold) {
-      throw new Error("Not enough available peers for signing")
+      throw new Error("Not enough available peers")
     }
 
+    const controller = new AbortController()
+
+    const attempts = permutations(availableCommits, threshold).map(async (commit, i) => {
+      if (i > 0) {
+        await delay(i * 1000, controller.signal)
+      }
+
+      return fn(commit, controller.signal)
+    })
+
+    try {
+      const result = await Promise.any(attempts)
+      controller.abort()
+      return result
+    } catch {
+      return undefined
+    }
+  }
+
+  async sign(stampedEvent: StampedEvent) {
     const event = prep(stampedEvent, this.userPubkey)
-    const members = sample(threshold, availableCommits).map(c => c.idx)
-    const template = Lib.create_session_template(members, event.id)
+    const allMessages: Message<SignCompleteResponse>[] = []
 
-    if (!template) throw new Error("Failed to create signing template")
+    const result = await this.racePermutations(async (selectedCommits, signal) => {
+      const members = selectedCommits.map(c => c.idx)
 
-    const request = Lib.create_session_pkg(this.group, template)
+      // Round 1: collect a fresh public nonce from every member.
+      const commitMessages = await Promise.all(
+        members.map(idx =>
+          this.rpc.post<SignCommitResponse>(
+            this.peers[idx - 1]!,
+            "/sign/commit",
+            {members},
+            {signal},
+          ),
+        ),
+      )
 
-    const messages = await Promise.all(
-      members.map(idx => {
-        const url = this.peers[idx - 1]!
+      if (!commitMessages.every(m => m.res?.ok)) throw new Error("Round 1 failure")
 
-        return this.rpc.post<SignResponse>(url, "/sign", {request})
-      }),
-    )
+      const template = Lib.create_session_template(members, event.id)
 
-    if (messages.every(m => m.res?.ok)) {
-      const ctx = Lib.get_session_ctx(this.group, request)
-      const pkgs = messages.map(m => m.res!.result!)
+      if (!template) throw new Error("Failed to create signing template")
+
+      const request = Lib.create_session_pkg(this.group, template)
+      const commits = commitMessages.map(m => m.res!.result!)
+      const commitIdByIdx = indexBy(c => c.idx, commits)
+      const pnonces = commits.map(c => ({
+        idx: c.idx,
+        hidden_pn: c.hidden_pn,
+        binder_pn: c.binder_pn,
+      }))
+
+      const completeRequest = {
+        content: request.content,
+        hash: request.hashes[0]!,
+        members: request.members,
+        stamp: request.stamp,
+        type: request.type,
+        gid: request.gid,
+        sid: request.sid,
+      }
+
+      const messages = await Promise.all(
+        members.map(idx =>
+          this.rpc.post<SignCompleteResponse>(
+            this.peers[idx - 1]!,
+            "/sign/complete",
+            {commit_id: commitIdByIdx.get(idx)!.commit_id, request: completeRequest, pnonces},
+            {signal},
+          ),
+        ),
+      )
+
+      allMessages.push(...messages)
+
+      if (!messages.every(m => m.res?.ok)) throw new Error("Round 2 failure")
+
+      const registrationByIdx = indexBy(c => c.idx, this.group.commits)
+
+      // Build the signing context from the fresh round-1 pnonces rather than the
+      // registration-time group.commits, applying the same additive per-sighash
+      // tweak as Lib.get_session_ctx via the substituted commit set.
+      const ctx = Lib.get_session_ctx(
+        {
+          ...this.group,
+          commits: pnonces.map(pn => ({
+            idx: pn.idx,
+            hidden_pn: pn.hidden_pn,
+            binder_pn: pn.binder_pn,
+            pubkey: registrationByIdx.get(pn.idx)!.pubkey,
+          })),
+        },
+        request,
+      )
+      const pkgs = messages.map(m => {
+        const {idx, psig, pubkey, sid} = m.res!.result!
+
+        return {idx, psigs: [psig], pubkey, sid}
+      })
       const sig = Lib.combine_signature_pkgs(ctx, pkgs)[0]?.[2]
 
-      if (sig) {
-        return {ok: true, messages, event: {...event, sig} as SignedEvent}
-      }
-    }
+      if (!sig) throw new Error("Failed to combine signatures")
 
-    return {ok: false, messages}
+      return {messages, event: {...event, sig} as SignedEvent}
+    })
+
+    if (result) return {ok: true as const, ...result}
+
+    return {ok: false as const, messages: allMessages}
   }
 
   async getConversationKey(ecdh_pk: string) {
-    const {threshold, commits} = this.group
-    const availableCommits = commits.filter(c => this.peers[c.idx - 1])
+    return this.racePermutations(async (selectedCommits, signal) => {
+      const members = selectedCommits.map(c => c.idx)
 
-    if (availableCommits.length < threshold) {
-      throw new Error("Not enough available peers for ECDH")
-    }
+      const results = await Promise.all(
+        members.map(idx =>
+          this.rpc
+            .post<EcdhResponse>(this.peers[idx - 1]!, "/ecdh", {idx, members, ecdh_pk}, {signal})
+            .then(r => r.res?.result),
+        ),
+      )
 
-    const members = sample(threshold, availableCommits).map(c => c.idx)
+      if (!results.every(isDefined)) throw new Error("Signer failure")
 
-    const results = await Promise.all(
-      members.map(idx => {
-        const url = this.peers[idx - 1]!
-
-        return this.rpc
-          .post<EcdhResponse>(url, "/ecdh", {idx, members, ecdh_pk})
-          .then(r => r.res?.result)
-      }),
-    )
-
-    if (results.every(isDefined)) {
       return bytesToHex(
         extract(
           sha256,
@@ -388,7 +467,7 @@ export class Client {
           textEncoder.encode("nip44-v2"),
         ),
       )
-    }
+    })
   }
 
   async listSessions() {
