@@ -9,6 +9,7 @@ use frost_taproot::types::{SecretNonce, SecretShare};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use subtle::ConstantTimeEq;
 
 use crate::nostr::{NostrAuth, parse_auth};
 use crate::ratelimit::{
@@ -21,18 +22,15 @@ use crate::schema::{
     RecoveryStartRequest, RecoveryStartResponse, RegisterRequest, RegisterResponse,
     SessionDeactivateRequest, SessionDeactivateResponse, SessionDeleteRequest,
     SessionDeleteResponse, SessionItem, SessionListResponse, Share, SignCommitRequest,
-    SignCommitResponse, SignCommitResult, SignCompleteRequest, SignCompleteResponse, SignRequest,
-    SignResponse,
+    SignCommitResponse, SignCommitResult, SignCompleteRequest, SignCompleteResponse,
 };
-use crate::session::{
-    create_ecdh_pkg, create_psig_pkg, create_psig_pkg_with_nonce, is_group_member,
-};
+use crate::session::{create_ecdh_pkg, create_psig_pkg_with_nonce, is_group_member};
 use crate::storage::{Collection, Storage, StorageBackend};
 
 const GENERATOR_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 
 const CLIENT_RATE_LIMITS: RateLimitConfig = RateLimitConfig {
-    max_attempts: 100,
+    max_attempts: 500,
     window_seconds: 60,
 };
 
@@ -273,7 +271,9 @@ impl Signer {
     fn take_commit(&self, commit_id: &str, client: &str) -> Option<CommitEntry> {
         let mut commits = self.commits_by_client.lock().unwrap();
         let pending = commits.get_mut(client)?;
-        let pos = pending.iter().position(|e| e.commit_id == commit_id)?;
+        let pos = pending
+            .iter()
+            .position(|e| ct_str_eq(&e.commit_id, commit_id))?;
         let entry = pending.swap_remove(pos);
         if pending.is_empty() {
             commits.remove(client);
@@ -304,13 +304,17 @@ impl Signer {
                         .clients
                         .iter()
                         .filter_map(|c| self.sessions.get(c))
-                        .filter(|s| s.password_hash.as_deref() == Some(&pa.password_hash))
+                        .filter(|s| {
+                            s.password_hash
+                                .as_deref()
+                                .is_some_and(|h| ct_str_eq(h, &pa.password_hash))
+                        })
                         .collect();
                 }
                 Auth::Otp(oa) => {
                     if let Some(challenge) = self.challenges.get(email_hash) {
                         self.challenges.delete(email_hash);
-                        if oa.otp == challenge.otp {
+                        if ct_str_eq(&oa.otp, &challenge.otp) {
                             sessions = index
                                 .clients
                                 .iter()
@@ -411,7 +415,7 @@ impl Signer {
             log::debug!("[client {}]: insufficient proof of work", &client[..8]);
             return RegisterResponse {
                 ok: false,
-                message: "Registration requires 20 bits of proof of work (NIP-13).".into(),
+                message: "Registration requires 16 bits of proof of work (NIP-13).".into(),
             };
         }
 
@@ -809,67 +813,6 @@ impl Signer {
         }
     }
 
-    fn handle_sign(&self, auth: &NostrAuth, data: SignRequest) -> SignResponse {
-        let client = &auth.pubkey;
-        let Some(session) = self.sessions.get(client) else {
-            log::debug!(
-                "[client {}]: signing failed - no session found",
-                &client[..8]
-            );
-            return SignResponse {
-                ok: false,
-                message: "No session found for client".into(),
-                result: None,
-            };
-        };
-
-        if session.deactivated_at.is_some() {
-            log::debug!(
-                "[client {}]: signing failed - session is deactivated",
-                &client[..8]
-            );
-            return SignResponse {
-                ok: false,
-                message: "Session is deactivated".into(),
-                result: None,
-            };
-        }
-
-        if !self.check_and_record_rate_limit(client) {
-            return SignResponse {
-                ok: false,
-                message: "Rate limit exceeded. Please try again later.".into(),
-                result: None,
-            };
-        }
-
-        match create_psig_pkg(&session.group, &data, &session.share) {
-            Ok(result) => {
-                self.sessions.set(
-                    client,
-                    &SignerSession {
-                        last_activity: now(),
-                        ..session
-                    },
-                );
-                log::debug!("[client {}]: signing complete", &client[..8]);
-                SignResponse {
-                    ok: true,
-                    message: "Successfully signed event".into(),
-                    result: Some(result),
-                }
-            }
-            Err(e) => {
-                log::debug!("[client {}]: signing failed - {}", &client[..8], e);
-                SignResponse {
-                    ok: false,
-                    message: "Failed to sign event".into(),
-                    result: None,
-                }
-            }
-        }
-    }
-
     fn handle_sign_commit(&self, auth: &NostrAuth, data: SignCommitRequest) -> SignCommitResponse {
         let client = &auth.pubkey;
         let Some(session) = self.sessions.get(client) else {
@@ -1041,13 +984,9 @@ impl Signer {
             };
         }
 
-        // Wrap the single-message request internally as hashes = vec![hash] so
-        // the existing session/signing logic runs unchanged over exactly one
-        // message. sid is computed over [hash], byte-identical to the one-message
-        // session the client/bifrost computed.
-        let inner = data.request.to_inner();
-
-        if !crate::session::verify_session_pkg(&session.group, &inner) {
+        // The request carries a single `hash`; sid is computed over [hash],
+        // byte-identical to the one-message session the client/bifrost computed.
+        if !crate::session::verify_session_pkg(&session.group, &data.request) {
             return SignCompleteResponse {
                 ok: false,
                 message: "Failed to verify session package".into(),
@@ -1057,7 +996,7 @@ impl Signer {
 
         match create_psig_pkg_with_nonce(
             &session.group,
-            &inner,
+            &data.request,
             &session.share,
             &entry.secret,
             pnonces,
@@ -1273,7 +1212,6 @@ impl Signer {
                     serde_json::to_value(self.handle_session_list(&auth)).unwrap()
                 }
             }
-            "/sign" => route!(body, |a, d| self.handle_sign(a, d)),
             "/sign/commit" => route!(body, |a, d| self.handle_sign_commit(a, d)),
             "/sign/complete" => route!(body, |a, d| self.handle_sign_complete(a, d)),
             _ => serde_json::json!({"ok": false, "message": "Not found"}),
@@ -1290,6 +1228,15 @@ fn hex_to_id(hex: &str) -> [u8; 32] {
 
 fn regex_is_hex64(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+}
+
+/// Compare two strings in constant time with respect to their contents.
+///
+/// `subtle`'s `ct_eq` requires equal-length slices to avoid leaking content,
+/// so unequal lengths short-circuit to `false`. Length is not the secret here
+/// (these are fixed-length hashes / capability tokens); the byte contents are.
+fn ct_str_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 fn hash_email(email: &str, url: &str, argon_m: u32) -> String {
@@ -1352,8 +1299,6 @@ mod tests {
     fn create_test_share(idx: u32) -> Share {
         Share {
             idx,
-            binder_sn: Hex32("e".repeat(64)),
-            hidden_sn: Hex32("f".repeat(64)),
             seckey: Hex32("1".repeat(64)),
         }
     }
@@ -1555,12 +1500,12 @@ mod tests {
 
         let client = "rate_limited_client";
 
-        // First 100 attempts should succeed
-        for _ in 0..100 {
+        // First 500 attempts should succeed
+        for _ in 0..500 {
             assert!(signer.check_and_record_rate_limit(client));
         }
 
-        // 101st attempt should fail (rate limited)
+        // 501st attempt should fail (rate limited)
         assert!(!signer.check_and_record_rate_limit(client));
     }
 
@@ -1726,7 +1671,7 @@ mod tests {
     #[test]
     fn test_two_round_sign_and_verify() {
         use crate::nostr::NostrAuth;
-        use crate::schema::{SighashVec, SignCompleteRequestInner, SignRequestInner};
+        use crate::schema::{SighashVec, SignCompleteRequestInner};
         use frost_taproot::frost::dealer::generate_dealer_package;
         use frost_taproot::sign::combine_partial_sigs;
         use frost_taproot::types::ShareSignature;
@@ -1788,7 +1733,6 @@ mod tests {
         // ── Register one session per signer (clients keyed arbitrarily) ──
         let clients = ["c".repeat(64), "d".repeat(64)];
         for (i, share) in low_shares.iter().enumerate() {
-            let cp = &commit_pkgs[i];
             signer.add_session(
                 &clients[i],
                 SignerSession {
@@ -1796,8 +1740,6 @@ mod tests {
                     share: Share {
                         idx: share.idx,
                         seckey: Hex32(hex::encode(share.seckey)),
-                        hidden_sn: Hex32(hex::encode(cp.hidden_sn)),
-                        binder_sn: Hex32(hex::encode(cp.binder_sn)),
                     },
                     group: schema_group.clone(),
                     recovery: false,
@@ -1840,33 +1782,23 @@ mod tests {
             .collect();
 
         // ── Build the session request bound to the fresh pnonces ──
+        // The complete request carries a single `hash` vector. sid is computed
+        // over [hash], byte-identical to the one-message session the client
+        // computes.
         let gid = hex::encode(crate::session::test_group_id(&schema_group));
-        let template = SignRequestInner {
+        let template = SignCompleteRequestInner {
             gid: Hex32(gid.clone()),
             sid: Hex32("00".repeat(32)),
             members: BoundedVec(members.clone()),
-            hashes: BoundedVec(vec![SighashVec(vec![Hex32(sighash_hex)])]),
+            hash: SighashVec(vec![Hex32(sighash_hex)]),
             content: None,
             kind: "message".to_string(),
             stamp: 1234567890,
         };
         let sid = hex::encode(crate::session::test_session_id(&schema_group, &template));
-        let request = SignRequestInner {
-            sid: Hex32(sid.clone()),
-            ..template
-        };
-
-        // The complete request carries a single `hash` vector; the signer wraps it
-        // internally as `hashes = vec![hash]`, producing a session byte-identical
-        // to `request` above.
         let complete_request = SignCompleteRequestInner {
-            gid: Hex32(gid.clone()),
             sid: Hex32(sid),
-            members: BoundedVec(members.clone()),
-            hash: SighashVec(vec![request.hashes.0[0].0[0].clone()]),
-            content: None,
-            kind: "message".to_string(),
-            stamp: 1234567890,
+            ..template
         };
 
         // ── Round 2: complete with both signers ──
@@ -1898,7 +1830,7 @@ mod tests {
 
         // ── Aggregate and verify against the real group key ──
         let base: Vec<_> = pnonces.clone();
-        let ctxs = crate::session::test_build_contexts(&schema_group, &request, &base);
+        let ctxs = crate::session::test_build_contexts(&schema_group, &complete_request, &base);
         let share_sigs: Vec<ShareSignature> = psig_results
             .iter()
             .map(|r| ShareSignature {

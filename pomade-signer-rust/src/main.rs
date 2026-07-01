@@ -14,7 +14,10 @@ use std::time::Duration;
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{
+        HeaderMap, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    },
     response::IntoResponse,
     routing::post,
 };
@@ -140,7 +143,7 @@ async fn main() {
 
     let options = SignerOptions {
         url: args.url,
-        register_pow: if test_mode { 0 } else { 20 },
+        register_pow: if test_mode { 0 } else { 16 },
         argon_m: if test_mode { 1024 } else { 64 * 1024 },
         from_email: args.mail_from_email,
         from_name: args.mail_from_name,
@@ -165,7 +168,7 @@ async fn main() {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE]);
 
     let app = Router::new()
         .route("/{*path}", post(handle))

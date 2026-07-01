@@ -33,18 +33,16 @@ func GenerateNonce(secret [32]byte, auxSeed *[32]byte) [32]byte {
 	return ecc.H3(input)
 }
 
-// GetPubkey derives a compressed public key from a secret key.
+// GetPubkey derives a compressed public key from a secret key. The scalar
+// multiplication is constant time with respect to the secret (see ecc.ScalarBaseMultiCT).
 func GetPubkey(secret [32]byte) [33]byte {
-	scalar := ecc.ScalarFromBytes(secret)
-	point := ecc.ScalarBaseMulti(scalar)
-	return ecc.SerializePoint(point)
+	return ecc.ScalarBaseMultiCT(secret)
 }
 
-// TweakSeckey tweaks a secret key: (seckey + tweak) mod N.
+// TweakSeckey tweaks a secret key: (seckey + tweak) mod N. The addition is
+// constant time with respect to the secret key (see ecc.ScalarAddCT).
 func TweakSeckey(seckey, tweak [32]byte) [32]byte {
-	tweakScalar := ecc.ScalarFromBytes(tweak)
-	secret := ecc.ScalarFromBytes(seckey)
-	return ecc.ScalarToBytes(ecc.ScalarAdd(secret, tweakScalar))
+	return ecc.ScalarAddCT(seckey, tweak)
 }
 
 // TweakPubkey tweaks a public key: pubkey_point + tweak*G.

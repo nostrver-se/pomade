@@ -26,7 +26,7 @@ import type {SignedEvent} from "@welshman/util"
 import type {ISigner} from "@welshman/signer"
 import {SessionItem, Auth, isPasswordAuth, isOTPAuth, Schema} from "./schema.js"
 import {IStorage, ICollection} from "./storage.js"
-import {hashEmail, debug, context} from "./util.js"
+import {hashEmail, debug, context, timingSafeStringEqual, withMinDuration} from "./util.js"
 import {
   RegisterRequest,
   RegisterResponse,
@@ -47,8 +47,6 @@ import {
   SessionDeactivateResponse,
   SessionDeleteRequest,
   SessionDeleteResponse,
-  SignRequest,
-  SignResponse,
   SignCommitRequest,
   SignCommitResponse,
   SignCompleteRequest,
@@ -69,7 +67,7 @@ import {
 const GENERATOR_X = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 
 const CLIENT_RATE_LIMITS: RateLimitConfig = {
-  maxAttempts: 100,
+  maxAttempts: 500,
   windowSeconds: int(1, MINUTE),
 }
 
@@ -100,9 +98,14 @@ function makeSessionItem(session: SignerSession): SessionItem {
   }
 }
 
+// The signer never needs the share's FROST nonce material: the two-round flow
+// generates a fresh nonce per /sign/commit and never touches stored nonces. Only
+// the index and secret share are persisted (and returned on recovery).
+export type StoredShare = Pick<SharePackage, "idx" | "seckey">
+
 export type SignerSession = {
   client: string
-  share: SharePackage
+  share: StoredShare
   group: GroupPackage
   recovery: boolean
   created_at: number
@@ -133,8 +136,6 @@ export type CommitEntry = {
   secret: FreshNonce
   created_at: number
 }
-
-export type SignResult = NonNullable<SignResponse["result"]>
 
 export type SignerSessionIndex = {
   clients: string[]
@@ -300,7 +301,7 @@ export class Signer {
   _createPsigPkgWithNonce(
     ctx: ReturnType<typeof Lib.get_session_ctx>,
     session: SignSessionPackage,
-    share: SharePackage,
+    share: StoredShare,
     secret: FreshNonce,
   ): SignCompleteResult {
     const tempShare: SharePackage = {
@@ -352,7 +353,9 @@ export class Signer {
     if (index) {
       if (isPasswordAuth(auth)) {
         sessions = filter(
-          session => session?.password_hash === auth.password_hash,
+          session =>
+            session?.password_hash !== undefined &&
+            timingSafeStringEqual(session.password_hash, auth.password_hash),
           await Promise.all(index.clients.map(client => this.sessions.get(client))),
         ) as SignerSession[]
       }
@@ -363,7 +366,7 @@ export class Signer {
         if (challenge) {
           await this.challenges.delete(auth.email_hash)
 
-          if (auth.otp === challenge.otp) {
+          if (timingSafeStringEqual(auth.otp, challenge.otp)) {
             sessions = removeUndefined(
               await Promise.all(index.clients.map(client => this.sessions.get(client))),
             )
@@ -457,7 +460,7 @@ export class Signer {
 
       if (getPow(auth) < context.registerPow) {
         debug(`[client ${client.slice(0, 8)}]: insufficient proof of work`)
-        return {ok: false, message: "Registration requires 20 bits of proof of work (NIP-13)."}
+        return {ok: false, message: "Registration requires 16 bits of proof of work (NIP-13)."}
       }
 
       if (!between([0, group.commits.length], group.threshold)) {
@@ -465,7 +468,7 @@ export class Signer {
         return {ok: false, message: "Invalid group threshold."}
       }
 
-      if (!Lib.is_group_member(group, share)) {
+      if (!Lib.is_group_member(group, share as SharePackage)) {
         debug(`[client ${client.slice(0, 8)}]: share does not belong to the provided group`)
         return {ok: false, message: "Share does not belong to the provided group."}
       }
@@ -718,42 +721,6 @@ export class Signer {
     return {ok: true, message: "Login successfully completed.", group: session.group}
   }
 
-  async _handleSign({pubkey: client}: SignedEvent, data: SignRequest): Promise<SignResponse> {
-    return this.options.storage.tx(async () => {
-      const session = await this.sessions.get(client)
-
-      if (!session) {
-        debug(`[client ${client.slice(0, 8)}]: signing failed - no session found`)
-        return {ok: false, message: "No session found for client"}
-      }
-
-      if (session.deactivated_at) {
-        debug(`[client ${client.slice(0, 8)}]: signing failed - session is deactivated`)
-        return {ok: false, message: "Session is deactivated"}
-      }
-
-      const allowed = await this._checkAndRecordRateLimit(client)
-      if (!allowed) {
-        return {ok: false, message: "Rate limit exceeded. Please try again later."}
-      }
-
-      try {
-        const ctx = Lib.get_session_ctx(session.group, data.request)
-        const partialSignature = Lib.create_psig_pkg(ctx, session.share)
-
-        await this.sessions.set(client, {...session, last_activity: now()})
-
-        debug(`[client ${client.slice(0, 8)}]: signing complete`)
-
-        return {result: partialSignature, ok: true, message: "Successfully signed event"}
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e)
-        debug(`[client ${client.slice(0, 8)}]: signing failed - ${msg}`)
-        return {ok: false, message: "Failed to sign event"}
-      }
-    })
-  }
-
   async _handleSignCommit(
     {pubkey: client}: SignedEvent,
     data: SignCommitRequest,
@@ -886,6 +853,7 @@ export class Signer {
 
       const own = pnonces.find(p => p.idx === session.share.idx)
 
+      // hidden_pn and binder_pn are public nonce points, so a plain compare is fine here.
       if (
         !own ||
         own.hidden_pn !== entry.secret.hidden_pn ||
@@ -945,7 +913,7 @@ export class Signer {
       }
 
       try {
-        const ecdhPackage = Lib.create_ecdh_pkg(members, ecdh_pk, session.share)
+        const ecdhPackage = Lib.create_ecdh_pkg(members, ecdh_pk, session.share as SharePackage)
 
         await this.sessions.set(client, {...session, last_activity: now()})
 
@@ -1047,7 +1015,9 @@ export class Signer {
       case "/challenge":
         return this._handle(auth, body, Schema.challengeRequest, this._handleChallenge.bind(this))
       case "/ecdh":
-        return this._handle(auth, body, Schema.ecdhRequest, this._handleEcdh.bind(this))
+        return withMinDuration(context.sensitiveMinMs, () =>
+          this._handle(auth, body, Schema.ecdhRequest, this._handleEcdh.bind(this)),
+        )
       case "/login/select":
         return this._handle(
           auth,
@@ -1101,16 +1071,11 @@ export class Signer {
           Schema.sessionListRequest,
           this._handleSessionList.bind(this),
         )
-      case "/sign":
-        return this._handle(auth, body, Schema.signRequest, this._handleSign.bind(this))
       case "/sign/commit":
         return this._handle(auth, body, Schema.signCommitRequest, this._handleSignCommit.bind(this))
       case "/sign/complete":
-        return this._handle(
-          auth,
-          body,
-          Schema.signCompleteRequest,
-          this._handleSignComplete.bind(this),
+        return withMinDuration(context.sensitiveMinMs, () =>
+          this._handle(auth, body, Schema.signCompleteRequest, this._handleSignComplete.bind(this)),
         )
       default:
         return {ok: false, message: "Not found"}
